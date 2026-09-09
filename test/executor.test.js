@@ -8,59 +8,190 @@ const { PollingRunner } = require('../src/polling-runner');
 const script = require('../src/scripts/messages');
 const { AGENT, TO } = require('../src');
 
-function loggerCapture() { const entries = []; return { entries, info: (message, details) => entries.push({ level: 'info', message, details }), error: (message, details) => entries.push({ level: 'error', message, details }) }; }
+function loggerCapture() {
+  const entries = [];
+  return {
+    entries,
+    info: (message, details) => entries.push({ level: 'info', message, details }),
+    error: (message, details) => entries.push({ level: 'error', message, details })
+  };
+}
+
 async function server(handler) {
   const instance = http.createServer(handler);
   await new Promise((resolve) => instance.listen(0, '127.0.0.1', resolve));
-  return { url: `http://127.0.0.1:${instance.address().port}/agent/send`, close: () => new Promise((resolve) => instance.close(resolve)) };
+  return {
+    url: `http://127.0.0.1:${instance.address().port}/agent/send`,
+    close: () => new Promise((resolve) => instance.close(resolve))
+  };
 }
-function readJson(req) { return new Promise((resolve, reject) => { let text = ''; req.setEncoding('utf8'); req.on('data', (chunk) => { text += chunk; }); req.on('end', () => { try { resolve(JSON.parse(text)); } catch (error) { reject(error); } }); req.on('error', reject); }); }
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let text = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { text += chunk; });
+    req.on('end', () => {
+      try { resolve(JSON.parse(text)); } catch (error) { reject(error); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function createRunner(options = {}) {
+  return new PollingRunner({
+    agent: AGENT,
+    to: TO,
+    script: options.script || script,
+    client: options.client || { sendMessage: async () => ({ ok: true, status: 200 }) },
+    logger: options.logger || loggerCapture(),
+    sleep: options.sleep,
+    subjectName: '安防智能体'
+  });
+}
 
 test('配置校验并按 host、port 生成固定回程 URL', () => {
-  assert.deepEqual(readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }), { ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' });
+  assert.deepEqual(
+    readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }),
+    { ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
+  );
   assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: 'bad', INGRESS_TOKEN: 'test' }), /INGRESS_PORT/);
   assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '1' }), /INGRESS_TOKEN/);
 });
 
-test('一个完整轮次向 Mock 依次发送安防映射、header 和三条剧本', async () => {
-  const requests = [];
-  const mock = await server(async (req, res) => { requests.push({ method: req.method, headers: req.headers, body: await readJson(req) }); res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"status":"ok","sent":true}'); });
-  try {
-    const waits = []; const log = loggerCapture();
-    const client = createRuisiClient({ ingressUrl: mock.url, authToken: 'test-token', timeoutMs: 1000, logger: log });
-    await new PollingRunner({ agent: AGENT, to: TO, script, client, logger: log, sleep: async (ms) => { waits.push(ms); } }).run({ maxRounds: 1 });
-    assert.equal(requests.length, 3);
-    assert.deepEqual(requests.map((request) => request.body), script.messages.map((message) => ({ agent: 'xslatdzp.SecOpsAgent', to: 'xslatdzp.demo001@rscom-chat.rsagent.net', body: message.body, groupchat: false })));
-    for (const request of requests) { assert.equal(request.method, 'POST'); assert.match(request.headers['content-type'], /application\/json/); assert.equal(request.headers['x-auth-token'], 'test-token'); }
-    assert.deepEqual(waits, [script.initialDelayMs, script.messages[0].delayAfterMs, script.defaultMessageIntervalMs]);
-  } finally { await mock.close(); }
+test('段落01第1条启动后立即发送，不先 sleep(0)', async () => {
+  const calls = [];
+  const waits = [];
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['first'] }] },
+    client: { sendMessage: async ({ body }) => { calls.push(body); return { ok: true, status: 200 }; } },
+    sleep: async (ms) => { waits.push(ms); }
+  });
+  await runner.run({ maxRounds: 1 });
+  assert.deepEqual(calls, ['first']);
+  assert.deepEqual(waits, [720000]);
 });
 
-test('HTTP 失败不会中断本轮后续消息', async () => {
-  const calls = []; const log = loggerCapture();
-  const runner = new PollingRunner({ agent: AGENT, to: TO, script: { initialDelayMs: 0, defaultMessageIntervalMs: 0, roundIntervalMs: 0, messages: [{ body: 'first' }, { body: 'second' }] }, logger: log, sleep: async () => {}, client: { sendMessage: async ({ body }) => { calls.push(body); return body === 'first' ? { ok: false, status: 503, error: 'unavailable' } : { ok: true, status: 200 }; } } });
+test('三消息段落只在相邻消息间等待40秒，末条后等待12分钟', async () => {
+  const events = [];
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two', 'three'] }] },
+    client: { sendMessage: async ({ body }) => { events.push(`send:${body}`); return { ok: true, status: 200 }; } },
+    sleep: async (ms) => { events.push(`sleep:${ms}`); }
+  });
   await runner.run({ maxRounds: 1 });
-  assert.deepEqual(calls, ['first', 'second']);
+  assert.deepEqual(events, ['send:one', 'sleep:40000', 'send:two', 'sleep:40000', 'send:three', 'sleep:720000']);
+});
+
+test('两消息段落末条到下一段首条之间仅等待12分钟', async () => {
+  const events = [];
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two'] }, { id: '02', messages: ['three'] }] },
+    client: { sendMessage: async ({ body }) => { events.push(`send:${body}`); return { ok: true, status: 200 }; } },
+    sleep: async (ms) => { events.push(`sleep:${ms}`); }
+  });
+  await runner.run({ maxRounds: 1 });
+  assert.deepEqual(events.slice(0, 4), ['send:one', 'sleep:40000', 'send:two', 'sleep:720000']);
+  assert.equal(events[4], 'send:three');
+});
+
+test('段落12在12分钟后回到段落01，不叠加额外等待', async () => {
+  const sent = [];
+  const waits = [];
+  const paragraphs = Array.from({ length: 12 }, (_, index) => ({ id: String(index + 1).padStart(2, '0'), messages: [String(index + 1)] }));
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs },
+    client: { sendMessage: async ({ paragraphId }) => { sent.push(paragraphId); return { ok: true, status: 200 }; } },
+    sleep: async (ms) => { waits.push(ms); }
+  });
+  await runner.run({ maxRounds: 2 });
+  assert.deepEqual(sent.slice(0, 13), ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '01']);
+  assert.ok(waits.every((ms) => ms === 720000));
+  assert.equal(waits.length, 24);
+});
+
+test('正式剧本完整顺序、数量与完整周期均正确', async () => {
+  const sent = [];
+  const waits = [];
+  const runner = createRunner({
+    client: { sendMessage: async (message) => { sent.push(message); return { ok: true, status: 200 }; } },
+    sleep: async (ms) => { waits.push(ms); }
+  });
+  await runner.run({ maxRounds: 1 });
+  const expected = script.paragraphs.flatMap((paragraph) => paragraph.messages.map((body, index) => ({
+    paragraphId: paragraph.id, body, messageIndex: index + 1, messageCount: paragraph.messages.length
+  })));
+  assert.equal(script.paragraphs.length, 12);
+  assert.equal(expected.length, 28);
+  assert.deepEqual(
+    sent.map(({ paragraphId, body, messageIndex, messageCount }) => ({ paragraphId, body, messageIndex, messageCount })),
+    expected
+  );
+  assert.equal(waits.filter((ms) => ms === 40000).length, 16);
+  assert.equal(waits.filter((ms) => ms === 720000).length, 12);
+  assert.equal(waits.reduce((sum, ms) => sum + ms, 0), 9280000);
+});
+
+test('Mock 回程逐条收到正式安防文案、固定映射与协议字段', async () => {
+  const requests = [];
+  const mock = await server(async (req, res) => {
+    requests.push({ method: req.method, headers: req.headers, body: await readJson(req) });
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"status":"ok","sent":true}');
+  });
+  try {
+    const client = createRuisiClient({ ingressUrl: mock.url, authToken: 'test-token', timeoutMs: 1000 });
+    await createRunner({ client, sleep: async () => {} }).run({ maxRounds: 1 });
+    const expectedBodies = script.paragraphs.flatMap((paragraph) => paragraph.messages);
+    assert.equal(requests.length, 28);
+    assert.deepEqual(requests.map((request) => request.body), expectedBodies.map((body) => ({
+      agent: 'xslatdzp.SecOpsAgent', to: 'xslatdzp.demo001@rscom-chat.rsagent.net', body, groupchat: false
+    })));
+    for (const request of requests) {
+      assert.equal(request.method, 'POST');
+      assert.match(request.headers['content-type'], /application\/json/);
+      assert.equal(request.headers['x-auth-token'], 'test-token');
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+test('单条HTTP失败后仍按正式时序完成后续段落', async () => {
+  const sent = [];
+  const log = loggerCapture();
+  const runner = createRunner({
+    logger: log,
+    client: {
+      sendMessage: async (message) => {
+        sent.push(message);
+        return sent.length === 1 ? { ok: false, status: 503, error: 'unavailable' } : { ok: true, status: 200 };
+      }
+    },
+    sleep: async () => {}
+  });
+  await runner.run({ maxRounds: 1 });
+  assert.equal(sent.length, 28);
+  assert.equal(sent.at(-1).paragraphId, '12');
   assert.ok(log.entries.some((entry) => entry.message.includes('继续后续轮询')));
 });
 
-test('非 2xx 由 HTTP client 返回受控失败，不抛出未处理异常', async () => {
-  const mock = await server((req, res) => res.writeHead(503).end());
-  try { assert.deepEqual(await createRuisiClient({ ingressUrl: mock.url, authToken: 'test-token' }).sendMessage({ agent: AGENT, to: TO, body: 'test', groupchat: false }), { ok: false, status: 503, error: 'RUISI ingress failed with status 503' }); } finally { await mock.close(); }
-});
-
-test('日志保持北京时间 HH:mm:ss 格式且 token 脱敏', () => {
-  assert.equal(formatBeijingTimestamp(new Date('2026-08-25T03:35:05.281Z')), '2026-08-25 11:35:05');
-  const lines = []; createLogger({ log: (line) => lines.push(line) }).info('test', { ingressToken: 'must-not-appear' });
-  assert.match(lines[0], /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[信息\]/); assert.doesNotMatch(lines[0], /must-not-appear/);
-});
-
-test('stop 会取消等待，且不会调度新消息', async () => {
-  const calls = [];
-  const runner = new PollingRunner({ agent: AGENT, to: TO, script: { initialDelayMs: 60000, defaultMessageIntervalMs: 0, roundIntervalMs: 0, messages: [{ body: 'must-not-send' }] }, client: { sendMessage: async () => { calls.push('sent'); return { ok: true, status: 200 }; } } });
+test('stop 在40秒等待中会取消等待且不再发送后续消息', async () => {
+  const sent = [];
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two'] }] },
+    client: { sendMessage: async ({ body }) => { sent.push(body); return { ok: true, status: 200 }; } }
+  });
   const running = runner.run();
   await new Promise((resolve) => setImmediate(resolve));
   runner.stop();
   await running;
-  assert.deepEqual(calls, []);
+  assert.deepEqual(sent, ['one']);
+});
+
+test('日志保持北京时间 HH:mm:ss 格式且 token 脱敏', () => {
+  assert.equal(formatBeijingTimestamp(new Date('2026-08-25T03:35:05.281Z')), '2026-08-25 11:35:05');
+  const lines = [];
+  createLogger({ log: (line) => lines.push(line) }).info('test', { ingressToken: 'must-not-appear' });
+  assert.match(lines[0], /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[信息\]/);
+  assert.doesNotMatch(lines[0], /must-not-appear/);
 });
