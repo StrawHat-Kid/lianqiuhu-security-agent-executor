@@ -13,7 +13,7 @@ npm test
 npm start
 ```
 
-`.env` 已被 Git 忽略，不能提交。可选 `INGRESS_TIMEOUT_MS` 默认值为 `5000` 毫秒。
+`.env` 已被 Git 忽略，不能提交。默认启动端口为 `18031`，可通过 `.env` 中的 `PORT` 覆盖；可选 `INGRESS_TIMEOUT_MS` 默认值为 `5000` 毫秒。
 
 ## 正式固定轮询
 

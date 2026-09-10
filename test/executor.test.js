@@ -51,10 +51,13 @@ function createRunner(options = {}) {
 }
 
 test('配置校验并按 host、port 生成固定回程 URL', () => {
+  const baseEnv = { INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
   assert.deepEqual(
-    readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }),
-    { ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
+    readConfig(baseEnv),
+    { port: 18031, ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
   );
+  assert.equal(readConfig({ ...baseEnv, PORT: '24000' }).port, 24000);
+  assert.throws(() => readConfig({ ...baseEnv, PORT: 'invalid' }), /PORT/);
   assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: 'bad', INGRESS_TOKEN: 'test' }), /INGRESS_PORT/);
   assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '1' }), /INGRESS_TOKEN/);
 });
