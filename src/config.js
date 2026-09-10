@@ -3,9 +3,10 @@ const dotenv = require('dotenv');
 const nonEmpty = (value) => typeof value === 'string' && value.trim() !== '';
 
 function readConfig(env = process.env) {
-  for (const name of ['INGRESS_HOST', 'INGRESS_PORT', 'INGRESS_TOKEN']) {
+  for (const name of ['AGENT', 'INGRESS_HOST', 'INGRESS_PORT', 'INGRESS_TOKEN']) {
     if (!nonEmpty(env[name])) throw new Error(`missing required environment variable: ${name}`);
   }
+  const agent = env.AGENT.trim();
   const port = Number(env.PORT || 18031);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('PORT must be a valid TCP port');
@@ -23,6 +24,7 @@ function readConfig(env = process.env) {
     throw new Error('INGRESS_TIMEOUT_MS must be a positive integer');
   }
   return {
+    agent,
     port,
     ingressHost,
     ingressPort,

@@ -5,7 +5,6 @@ const { PollingRunner } = require('./polling-runner');
 const { createHealthServer, listenHttpServer, closeHttpServer } = require('./http-server');
 const script = require('./scripts/messages');
 
-const AGENT = 'xslatdzp.SecOpsAgent';
 const TO = 'xslatdzp.demo001@rscom-chat.rsagent.net';
 const SUBJECT_NAME = '安防智能体';
 
@@ -24,7 +23,7 @@ async function start({
 
   logger.info('[专题轮询] 执行器启动中', {
     name: SUBJECT_NAME,
-    agent: AGENT,
+    agent: config.agent,
     to: TO,
     port: config.port,
     ingressHost: config.ingressHost,
@@ -51,7 +50,7 @@ async function start({
     logger
   });
   const runner = createPollingRunnerFn({
-    agent: AGENT,
+    agent: config.agent,
     to: TO,
     script: scriptDefinition,
     client,
@@ -153,7 +152,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  AGENT,
   TO,
   SUBJECT_NAME,
   start,

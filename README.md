@@ -2,7 +2,7 @@
 
 此进程按正式固定剧本，将 安防 专题文字逐条发送到 RUISI-OSCA 回程接口；不接收 IOC 指令、不使用 MQTT，也不生成园区数据。
 
-固定映射：`安防智能体` → `xslatdzp.SecOpsAgent`，接收方为 `xslatdzp.demo001@rscom-chat.rsagent.net`。
+固定映射：`安防智能体` 的 AGENT 由 `.env` 配置，接收方为 `xslatdzp.demo001@rscom-chat.rsagent.net`。
 
 ## 使用
 
@@ -13,7 +13,12 @@ npm test
 npm start
 ```
 
-`.env` 已被 Git 忽略，不能提交。默认启动端口为 `18031`，可通过 `.env` 中的 `PORT` 覆盖；可选 `INGRESS_TIMEOUT_MS` 默认值为 `5000` 毫秒。
+`.env` 已被 Git 忽略，不能提交。默认启动端口为 `18031`，`PORT` 与 `AGENT` 均可通过 `.env` 配置；可选 `INGRESS_TIMEOUT_MS` 默认值为 `5000` 毫秒。
+
+```bash
+PORT=18031
+AGENT=rs-demorg-secops
+```
 
 ## 正式固定轮询
 

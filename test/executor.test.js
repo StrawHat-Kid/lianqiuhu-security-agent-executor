@@ -7,7 +7,9 @@ const { createLogger, formatBeijingTimestamp } = require('../src/logger');
 const { createRuisiClient } = require('../src/ruisi-client');
 const { PollingRunner } = require('../src/polling-runner');
 const script = require('../src/scripts/messages');
-const { AGENT, TO, start, installShutdownHandlers } = require('../src');
+const { TO, start, installShutdownHandlers } = require('../src');
+
+const TEST_AGENT = 'rs-demorg-secops';
 
 function loggerCapture() {
   const entries = [];
@@ -41,7 +43,7 @@ function readJson(req) {
 
 function createRunner(options = {}) {
   return new PollingRunner({
-    agent: AGENT,
+    agent: options.agent || TEST_AGENT,
     to: TO,
     script: options.script || script,
     client: options.client || { sendMessage: async () => ({ ok: true, status: 200 }) },
@@ -52,15 +54,17 @@ function createRunner(options = {}) {
 }
 
 test('配置校验并按 host、port 生成固定回程 URL', () => {
-  const baseEnv = { INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
+  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
   assert.deepEqual(
     readConfig(baseEnv),
-    { port: 18031, ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
+    { agent: TEST_AGENT, port: 18031, ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
   );
+  assert.equal(readConfig({ ...baseEnv, AGENT: 'overridden-agent' }).agent, 'overridden-agent');
+  assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }), /AGENT/);
   assert.equal(readConfig({ ...baseEnv, PORT: '24000' }).port, 24000);
   assert.throws(() => readConfig({ ...baseEnv, PORT: 'invalid' }), /PORT/);
-  assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: 'bad', INGRESS_TOKEN: 'test' }), /INGRESS_PORT/);
-  assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '1' }), /INGRESS_TOKEN/);
+  assert.throws(() => readConfig({ AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: 'bad', INGRESS_TOKEN: 'test' }), /INGRESS_PORT/);
+  assert.throws(() => readConfig({ AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '1' }), /INGRESS_TOKEN/);
 });
 
 test('段落01第1条启动后立即发送，不先 sleep(0)', async () => {
@@ -148,7 +152,7 @@ test('Mock 回程逐条收到正式安防文案、固定映射与协议字段', 
     const expectedBodies = script.paragraphs.flatMap((paragraph) => paragraph.messages);
     assert.equal(requests.length, 28);
     assert.deepEqual(requests.map((request) => request.body), expectedBodies.map((body) => ({
-      agent: 'xslatdzp.SecOpsAgent', to: 'xslatdzp.demo001@rscom-chat.rsagent.net', body, groupchat: false
+      agent: TEST_AGENT, to: 'xslatdzp.demo001@rscom-chat.rsagent.net', body, groupchat: false
     })));
     for (const request of requests) {
       assert.equal(request.method, 'POST');
@@ -202,6 +206,7 @@ test('日志保持北京时间 HH:mm:ss 格式且 token 脱敏', () => {
 
 function createTestConfig(port) {
   return {
+    agent: TEST_AGENT,
     port,
     ingressHost: '127.0.0.1',
     ingressPort: 29876,
@@ -263,15 +268,18 @@ test('HTTP 服务实际监听配置端口，GET /health 返回 200', async () =>
   await new Promise((resolve) => probe.close(resolve));
 
   const runner = createControllableRunner();
+  let runnerOptions;
   const running = await start({
     logger: loggerCapture(),
     loadConfigFn: () => createTestConfig(port),
     createRuisiClientFn: () => ({}),
-    createPollingRunnerFn: () => runner
+    createPollingRunnerFn: (options) => { runnerOptions = options; return runner; }
   });
 
   try {
     assert.equal(running.server.address().port, port);
+    assert.equal(running.config.agent, TEST_AGENT);
+    assert.equal(runnerOptions.agent, TEST_AGENT);
     assert.equal(runner.started, 1);
     assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
   } finally {
