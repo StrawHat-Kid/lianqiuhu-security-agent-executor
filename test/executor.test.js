@@ -1,4 +1,5 @@
 const http = require('node:http');
+const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { readConfig } = require('../src/config');
@@ -6,7 +7,7 @@ const { createLogger, formatBeijingTimestamp } = require('../src/logger');
 const { createRuisiClient } = require('../src/ruisi-client');
 const { PollingRunner } = require('../src/polling-runner');
 const script = require('../src/scripts/messages');
-const { AGENT, TO } = require('../src');
+const { AGENT, TO, start, installShutdownHandlers } = require('../src');
 
 function loggerCapture() {
   const entries = [];
@@ -198,3 +199,129 @@ test('日志保持北京时间 HH:mm:ss 格式且 token 脱敏', () => {
   assert.match(lines[0], /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[信息\]/);
   assert.doesNotMatch(lines[0], /must-not-appear/);
 });
+
+function createTestConfig(port) {
+  return {
+    port,
+    ingressHost: '127.0.0.1',
+    ingressPort: 29876,
+    ingressToken: 'test-token',
+    ingressTimeoutMs: 1000,
+    ingressUrl: 'http://127.0.0.1:29876/agent/send'
+  };
+}
+
+function createControllableRunner() {
+  let resolveRun;
+  let resolveStopped;
+
+  const runner = {
+    started: 0,
+    stopped: 0,
+    stoppedPromise: new Promise((resolve) => { resolveStopped = resolve; }),
+    run() {
+      this.started += 1;
+      return new Promise((resolve) => { resolveRun = resolve; });
+    },
+    stop() {
+      this.stopped += 1;
+      resolveStopped();
+      resolveRun();
+    }
+  };
+
+  return runner;
+}
+
+async function requestHealth(port) {
+  return new Promise((resolve, reject) => {
+    const request = http.get({ host: '127.0.0.1', port, path: '/health' }, (response) => {
+      response.setEncoding('utf8');
+      let body = '';
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => resolve({ statusCode: response.statusCode, body }));
+    });
+    request.on('error', reject);
+  });
+}
+
+async function bindPort(port) {
+  const instance = http.createServer();
+  await new Promise((resolve, reject) => {
+    instance.once('error', reject);
+    instance.listen(port, () => {
+      instance.removeListener('error', reject);
+      resolve();
+    });
+  });
+  return instance;
+}
+
+test('HTTP 服务实际监听配置端口，GET /health 返回 200', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runner = createControllableRunner();
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => runner
+  });
+
+  try {
+    assert.equal(running.server.address().port, port);
+    assert.equal(runner.started, 1);
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('端口被占用时启动失败，Polling Runner 不会启动', async () => {
+  const blocker = await bindPort(0);
+  const port = blocker.address().port;
+  let runnerCreated = false;
+
+  try {
+    await assert.rejects(
+      start({
+        logger: loggerCapture(),
+        loadConfigFn: () => createTestConfig(port),
+        createRuisiClientFn: () => ({}),
+        createPollingRunnerFn: () => { runnerCreated = true; return createControllableRunner(); }
+      }),
+      /EADDRINUSE/
+    );
+    assert.equal(runnerCreated, false);
+  } finally {
+    await new Promise((resolve) => blocker.close(resolve));
+  }
+});
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  test('收到 ' + signal + ' 后停止轮询并释放监听端口', async () => {
+    const probe = await bindPort(0);
+    const port = probe.address().port;
+    await new Promise((resolve) => probe.close(resolve));
+
+    const runner = createControllableRunner();
+    const running = await start({
+      logger: loggerCapture(),
+      loadConfigFn: () => createTestConfig(port),
+      createRuisiClientFn: () => ({}),
+      createPollingRunnerFn: () => runner
+    });
+    const processRef = new EventEmitter();
+    const shutdownHandlers = installShutdownHandlers({ running, logger: loggerCapture(), processRef });
+
+    processRef.emit(signal);
+    await runner.stoppedPromise;
+    await shutdownHandlers.shutdown(signal);
+
+    assert.equal(runner.stopped, 1);
+    const rebound = await bindPort(port);
+    await new Promise((resolve) => rebound.close(resolve));
+  });
+}
