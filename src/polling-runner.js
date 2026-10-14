@@ -52,9 +52,9 @@ class PollingRunner {
     return result !== false && !this.stopped;
   }
 
-  stop() {
+  stop({ abortInFlight = true } = {}) {
     this.stopped = true;
-    this.activeController?.abort();
+    if (abortInFlight) this.activeController?.abort();
     this.pendingWake?.();
   }
 
