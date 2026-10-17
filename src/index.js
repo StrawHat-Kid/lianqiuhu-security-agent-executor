@@ -42,6 +42,7 @@ async function start({
   const controller = createPollingControllerFn({
     logger,
     subjectName: SUBJECT_NAME,
+    maxDurationMs: config.pollingMaxDurationMs,
     createRunner: () => createPollingRunnerFn({
       agent: config.agent,
       to: TO,
@@ -73,7 +74,8 @@ async function start({
     name: SUBJECT_NAME,
     commandPath: '/api/commands',
     startAction: POLLING_START_ACTION,
-    cancelAction: POLLING_CANCEL_ACTION
+    cancelAction: POLLING_CANCEL_ACTION,
+    pollingMaxDurationHours: config.pollingMaxDurationHours
   });
 
   let shutdownPromise;

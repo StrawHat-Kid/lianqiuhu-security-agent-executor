@@ -1,18 +1,23 @@
 'use strict';
 
-function createPollingController({ createRunner, logger, subjectName } = {}) {
+function createPollingController({ createRunner, logger, subjectName, maxDurationMs } = {}) {
   if (typeof createRunner !== 'function') {
     throw new Error('createRunner is required');
+  }
+  if (maxDurationMs !== undefined && maxDurationMs !== null && (!Number.isFinite(maxDurationMs) || maxDurationMs <= 0)) {
+    throw new Error('maxDurationMs must be a positive finite number');
   }
 
   const log = logger || { info() {}, warn() {}, error() {} };
   const name = subjectName || 'polling';
+  const maxDurationLimitMs = maxDurationMs === undefined || maxDurationMs === null ? null : maxDurationMs;
 
   let state = 'idle';
   let runner = null;
   let runSettled = null;
   let runCompleted = false;
   let startedAt = null;
+  let maxDurationTimer = null;
   let transition = Promise.resolve();
 
   function enqueue(task) {
@@ -21,7 +26,37 @@ function createPollingController({ createRunner, logger, subjectName } = {}) {
     return result;
   }
 
+  function clearMaxDurationTimer() {
+    if (maxDurationTimer !== null) {
+      clearTimeout(maxDurationTimer);
+      maxDurationTimer = null;
+    }
+  }
+
+  function scheduleMaxDuration() {
+    clearMaxDurationTimer();
+    if (maxDurationLimitMs === null) return;
+    maxDurationTimer = setTimeout(() => {
+      maxDurationTimer = null;
+      log.warn('[专题轮询控制] 已达最长运行时长，自动停止回程轮询', {
+        name,
+        maxDurationMs: maxDurationLimitMs,
+        reason: 'max-duration'
+      });
+      enqueue(() => stopNow({ abortInFlight: false, reason: 'max-duration' })).catch((error) => {
+        log.error('[专题轮询控制] 最长运行时长自动停止失败', {
+          name,
+          error: error && error.message ? error.message : String(error)
+        });
+      });
+    }, maxDurationLimitMs);
+    if (typeof maxDurationTimer.unref === 'function') {
+      maxDurationTimer.unref();
+    }
+  }
+
   function clearRunner() {
+    clearMaxDurationTimer();
     runner = null;
     runSettled = null;
     runCompleted = false;
@@ -67,11 +102,13 @@ function createPollingController({ createRunner, logger, subjectName } = {}) {
     );
     runSettled.then(handleUnexpectedExit);
     state = 'running';
+    scheduleMaxDuration();
     log.info('[专题轮询控制] 回程轮询已开启', { name, reason, startedAt });
     return { state: 'running', alreadyRunning: false };
   }
 
   async function stopNow({ abortInFlight = false, reason = 'control' } = {}) {
+    clearMaxDurationTimer();
     if (state !== 'running') {
       return { state: 'stopped', alreadyStopped: true };
     }

@@ -13,7 +13,7 @@ npm test
 npm start
 ```
 
-`.env` 已被 Git 忽略，不能提交。默认启动端口为 `18031`，`PORT` 与 `AGENT` 均可通过 `.env` 配置；可选 `INGRESS_TIMEOUT_MS` 默认值为 `5000` 毫秒。
+`.env` 已被 Git 忽略，不能提交。默认启动端口为 `18031`，`PORT` 与 `AGENT` 均可通过 `.env` 配置；可选 `INGRESS_TIMEOUT_MS` 默认值为 `5000` 毫秒；可选 `POLLING_MAX_DURATION_HOURS` 控制回程轮询最长运行时长，默认值为 `10` 小时，可通过部署环境变量或 `.env`（如 `POLLING_MAX_DURATION_HOURS=10`）修改，取值必须为大于 0 的有限数值且换算为毫秒后不超过 `2147483647`（约 `596.52` 小时），非法或超限值会在启动时明确报错而不会静默改变行为。
 
 ```bash
 PORT=18031
@@ -47,6 +47,7 @@ curl -X POST http://127.0.0.1:18031/api/commands \
 - 也接受 `{"commands":[...]}` 信封格式（与指令执行器一致）；`params` 可省略或为空对象，内容会被忽略。
 - 未知 action、非法 JSON、空数组、仅含 action 的单个对象、`params` 非对象等返回 `400 {"ok":false,"error":"..."}`；`/api/commands` 使用非 POST 方法返回 `405`；其他路径返回 `404 {"status":"not_found"}`。
 - 停止后再次发送启动指令会创建新的轮询任务，并从段落 01 第 1 条重新开始；`SIGINT`/`SIGTERM` 仍会中止在途请求并退出进程。
+- 轮询从首次启动开始按 `POLLING_MAX_DURATION_HOURS` 计时，重复启动不会重置或延长该计时；到期后自动停止轮询（等待在途请求完成，语义与取消指令一致），HTTP 服务不退出，之后的启动指令会重新开始一轮完整计时。手动取消会清理该定时器。
 - 原 `/api/polling/start`、`/api/polling/stop`、`/api/polling/status` 路由已移除，不再对外提供。
 - 健康检查：`GET /health` 返回 HTTP `200` 与 `{"status":"ok"}`，停止轮询后仍然可用。
 

@@ -6,6 +6,7 @@ const { readConfig } = require('../src/config');
 const { createLogger, formatBeijingTimestamp } = require('../src/logger');
 const { createRuisiClient } = require('../src/ruisi-client');
 const { PollingRunner } = require('../src/polling-runner');
+const { createPollingController } = require('../src/polling-controller');
 const script = require('../src/scripts/messages');
 const { TO, start, installShutdownHandlers } = require('../src');
 
@@ -16,6 +17,7 @@ function loggerCapture() {
   return {
     entries,
     info: (message, details) => entries.push({ level: 'info', message, details }),
+    warn: (message, details) => entries.push({ level: 'warn', message, details }),
     error: (message, details) => entries.push({ level: 'error', message, details })
   };
 }
@@ -57,7 +59,7 @@ test('配置校验并按 host、port 生成固定回程 URL', () => {
   const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
   assert.deepEqual(
     readConfig(baseEnv),
-    { agent: TEST_AGENT, port: 18031, ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
+    { agent: TEST_AGENT, port: 18031, ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, pollingMaxDurationHours: 10, pollingMaxDurationMs: 36000000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
   );
   assert.equal(readConfig({ ...baseEnv, AGENT: 'overridden-agent' }).agent, 'overridden-agent');
   assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }), /AGENT/);
@@ -204,7 +206,7 @@ test('日志保持北京时间 HH:mm:ss 格式且 token 脱敏', () => {
   assert.doesNotMatch(lines[0], /must-not-appear/);
 });
 
-function createTestConfig(port) {
+function createTestConfig(port, overrides = {}) {
   return {
     agent: TEST_AGENT,
     port,
@@ -212,8 +214,15 @@ function createTestConfig(port) {
     ingressPort: 29876,
     ingressToken: 'test-token',
     ingressTimeoutMs: 1000,
-    ingressUrl: 'http://127.0.0.1:29876/agent/send'
+    pollingMaxDurationHours: 10,
+    pollingMaxDurationMs: 36000000,
+    ingressUrl: 'http://127.0.0.1:29876/agent/send',
+    ...overrides
   };
+}
+
+function drainTasks() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function createControllableRunner() {
@@ -691,4 +700,301 @@ test('未开启轮询时收到 SIGTERM 仍释放监听端口', async () => {
 
   const rebound = await bindPort(port);
   await new Promise((resolve) => rebound.close(resolve));
+});
+
+test('配置项 POLLING_MAX_DURATION_HOURS 默认 10 小时，合法值生效，非法值启动时明确报错', () => {
+  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
+  assert.equal(readConfig(baseEnv).pollingMaxDurationHours, 10);
+  assert.equal(readConfig(baseEnv).pollingMaxDurationMs, 36000000);
+  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '' }).pollingMaxDurationHours, 10);
+  const custom = readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.5' });
+  assert.equal(custom.pollingMaxDurationHours, 0.5);
+  assert.equal(custom.pollingMaxDurationMs, 1800000);
+  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '2' }).pollingMaxDurationMs, 7200000);
+  for (const invalid of ['0', '-1', 'abc', 'Infinity', 'NaN', '1e999']) {
+    assert.throws(() => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: invalid }), /POLLING_MAX_DURATION_HOURS/);
+  }
+});
+
+test('配置项 POLLING_MAX_DURATION_HOURS 拒绝定时器溢出值和舍入为零的值', () => {
+  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
+  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.52' }).pollingMaxDurationMs, 2147472000);
+  assert.throws(
+    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.53' }),
+    /POLLING_MAX_DURATION_HOURS is out of supported range.*2147483647/
+  );
+  assert.throws(
+    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '1000' }),
+    /POLLING_MAX_DURATION_HOURS is out of supported range.*2147483647/
+  );
+  assert.throws(
+    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.0000001' }),
+    /POLLING_MAX_DURATION_HOURS is out of supported range/
+  );
+});
+
+function createControllablePollingController({ runners, maxDurationMs = 3600000, logger = loggerCapture() } = {}) {
+  return createPollingController({
+    logger,
+    subjectName: '安防智能体',
+    maxDurationMs,
+    createRunner: () => {
+      const runner = createControllableRunner();
+      runners.push(runner);
+      return runner;
+    }
+  });
+}
+
+test('轮询控制器默认空闲；启动后开始计时，到期自动停止并回到可再次启动状态', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const log = loggerCapture();
+  const runners = [];
+  const controller = createControllablePollingController({ runners, maxDurationMs: 5000, logger: log });
+
+  assert.equal(controller.getStatus().state, 'stopped');
+  assert.equal(runners.length, 0);
+
+  assert.deepEqual(await controller.start('test'), { state: 'running', alreadyRunning: false });
+  assert.equal(runners.length, 1);
+  assert.equal(runners[0].started, 1);
+  assert.equal(controller.getStatus().state, 'running');
+
+  t.mock.timers.tick(4999);
+  await drainTasks();
+  assert.equal(runners[0].stopped, 0);
+  assert.equal(controller.getStatus().state, 'running');
+
+  t.mock.timers.tick(1);
+  await drainTasks();
+  assert.equal(runners[0].stopped, 1);
+  assert.equal(controller.getStatus().state, 'stopped');
+  assert.ok(log.entries.some((entry) => entry.level === 'warn' && entry.message.includes('最长运行时长')));
+
+  assert.deepEqual(await controller.start('test'), { state: 'running', alreadyRunning: false });
+  assert.equal(runners.length, 2);
+  t.mock.timers.tick(5000);
+  await drainTasks();
+  assert.equal(runners[1].stopped, 1);
+  assert.equal(controller.getStatus().state, 'stopped');
+});
+
+test('轮询期间重复启动不创建第二个任务且不重置最长运行时长', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const runners = [];
+  const controller = createControllablePollingController({ runners, maxDurationMs: 10000 });
+  await controller.start('test');
+
+  t.mock.timers.tick(9000);
+  await drainTasks();
+  assert.deepEqual(await controller.start('test'), { state: 'running', alreadyRunning: true });
+  assert.equal(runners.length, 1);
+  assert.equal(runners[0].started, 1);
+
+  t.mock.timers.tick(999);
+  await drainTasks();
+  assert.equal(runners[0].stopped, 0);
+
+  t.mock.timers.tick(1);
+  await drainTasks();
+  assert.equal(runners[0].stopped, 1);
+  assert.equal(controller.getStatus().state, 'stopped');
+});
+
+test('手动取消清理最长运行时长定时器，越过原到期点不产生自动停止，重新启动获得完整计时周期', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const log = loggerCapture();
+  const runners = [];
+  const controller = createControllablePollingController({ runners, maxDurationMs: 10000, logger: log });
+  await controller.start('test');
+  t.mock.timers.tick(3000);
+  await drainTasks();
+
+  assert.deepEqual(await controller.stop({ abortInFlight: false, reason: 'test' }), { state: 'stopped', alreadyStopped: false });
+  assert.equal(runners[0].stopped, 1);
+  assert.equal(controller.getStatus().state, 'stopped');
+  assert.equal(log.entries.filter((entry) => entry.message.includes('最长运行时长')).length, 0);
+
+  t.mock.timers.tick(100000);
+  await drainTasks();
+  assert.equal(runners[0].stopped, 1);
+  assert.equal(runners.length, 1);
+  assert.equal(controller.getStatus().state, 'stopped');
+  assert.equal(log.entries.filter((entry) => entry.message.includes('最长运行时长')).length, 0);
+
+  await controller.start('test');
+  assert.equal(runners.length, 2);
+  t.mock.timers.tick(9999);
+  await drainTasks();
+  assert.equal(runners[1].stopped, 0);
+  t.mock.timers.tick(1);
+  await drainTasks();
+  assert.equal(runners[1].stopped, 1);
+  assert.deepEqual(await controller.stop({ abortInFlight: false, reason: 'test' }), { state: 'stopped', alreadyStopped: true });
+});
+
+test('自动停止与手动取消同时发生保持幂等，不重复停止也不残留定时器', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const runners = [];
+  const controller = createControllablePollingController({ runners, maxDurationMs: 5000 });
+  await controller.start('test');
+
+  t.mock.timers.tick(5000);
+  const cancel = controller.stop({ abortInFlight: false, reason: 'race' });
+  await drainTasks();
+  assert.deepEqual(await cancel, { state: 'stopped', alreadyStopped: true });
+  assert.equal(runners[0].stopped, 1);
+  assert.equal(controller.getStatus().state, 'stopped');
+
+  assert.deepEqual(await controller.stop({ abortInFlight: false, reason: 'race' }), { state: 'stopped', alreadyStopped: true });
+  t.mock.timers.tick(100000);
+  await drainTasks();
+  assert.equal(runners[0].stopped, 1);
+  assert.equal(runners.length, 1);
+});
+
+test('自动停止按现有停止语义等待在途请求完成，不中止也不重发', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let resolveSend = null;
+  let sendCount = 0;
+  const client = {
+    sendMessage: () => {
+      sendCount += 1;
+      return new Promise((resolve) => { resolveSend = () => resolve({ ok: true, status: 200 }); });
+    }
+  };
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two'] }] },
+    client,
+    sleep: async () => {}
+  });
+  const controller = createPollingController({
+    logger: loggerCapture(),
+    subjectName: '安防智能体',
+    maxDurationMs: 1000,
+    createRunner: () => runner
+  });
+
+  await controller.start('test');
+  await drainTasks();
+  assert.equal(sendCount, 1);
+
+  t.mock.timers.tick(1000);
+  await drainTasks();
+  assert.equal(runner.activeController.signal.aborted, false);
+  assert.equal(sendCount, 1);
+  assert.equal(controller.getStatus().state, 'stopping');
+
+  resolveSend();
+  await drainTasks();
+  assert.equal(controller.getStatus().state, 'stopped');
+  assert.equal(sendCount, 1);
+});
+
+test('最长运行时长定时器 unref，不阻止进程按原有逻辑退出', async () => {
+  const captured = [];
+  const originalSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, ms, ...args) => {
+    const timer = originalSetTimeout(callback, ms, ...args);
+    captured.push({ ms, timer });
+    return timer;
+  };
+  try {
+    const controller = createPollingController({
+      logger: loggerCapture(),
+      subjectName: '安防智能体',
+      maxDurationMs: 3600000,
+      createRunner: () => createControllableRunner()
+    });
+    await controller.start('test');
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].ms, 3600000);
+    assert.equal(captured[0].timer.hasRef(), false);
+    await controller.stop({ abortInFlight: false, reason: 'test' });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+  }
+});
+
+test('HTTP 启动指令开始计时，自动停止后服务仍可用且可再次启动', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port, { pollingMaxDurationMs: 2000 }),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI安防智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling started' }
+    });
+    assert.equal(runners.length, 1);
+
+    t.mock.timers.tick(2000);
+    await drainTasks();
+    assert.equal(runners[0].stopped, 1);
+    assert.equal(running.controller.getStatus().state, 'stopped');
+
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI安防智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling started' }
+    });
+    assert.equal(runners.length, 2);
+    assert.equal(running.controller.getStatus().state, 'running');
+
+    t.mock.timers.tick(2000);
+    await drainTasks();
+    assert.equal(runners[1].stopped, 1);
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('HTTP 轮询期间重复启动不重置自动停止计时', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port, { pollingMaxDurationMs: 3000 }),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI安防智能体', params: {} }]);
+    t.mock.timers.tick(2500);
+    await drainTasks();
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI安防智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling already running' }
+    });
+    assert.equal(runners.length, 1);
+    assert.equal(runners[0].started, 1);
+    assert.equal(runners[0].stopped, 0);
+
+    t.mock.timers.tick(499);
+    await drainTasks();
+    assert.equal(runners[0].stopped, 0);
+
+    t.mock.timers.tick(1);
+    await drainTasks();
+    assert.equal(runners[0].stopped, 1);
+    assert.equal(runners.length, 1);
+  } finally {
+    await running.shutdown('test');
+  }
 });
