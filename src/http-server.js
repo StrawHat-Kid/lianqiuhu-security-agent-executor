@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('node:http');
+const { TOKEN_HEADER, resolveExhibitionId, readTokenHeader } = require('./hall-auth');
 
 const BODY_LIMIT_BYTES = 100 * 1024;
 
@@ -94,14 +95,14 @@ async function executeCommands(commands, controller, pollingActions) {
   return { ok: true, status: 200, message };
 }
 
-async function handleCommandsRequest(request, response, { controller, pollingActions, log }) {
+async function handleCommandsRequest(request, response, { controller, exhibitionId, pollingActions, log }) {
   let text;
   try {
     text = await readRequestBody(request);
   } catch (error) {
     const message = error && error.message ? error.message : 'request body read failed';
     const status = message === 'request body too large' ? 413 : 400;
-    log.error('[专题轮询控制] 读取请求体失败', { error: message });
+    log.error('[专题轮询控制] 读取请求体失败', { exhibitionId, error: message });
     sendJson(response, status, { ok: false, error: message });
     return;
   }
@@ -133,6 +134,13 @@ async function handleCommandsRequest(request, response, { controller, pollingAct
     return;
   }
 
+  if (isPlainObject(body) && Object.prototype.hasOwnProperty.call(body, 'exhibitionId')) {
+    log.warn('[专题轮询控制] 忽略请求体中的 exhibitionId，使用服务端 Token 映射', {
+      exhibitionId,
+      bodyExhibitionId: String(body.exhibitionId)
+    });
+  }
+
   try {
     const result = await executeCommands(commands, controller, pollingActions);
     if (result.ok) {
@@ -142,14 +150,15 @@ async function handleCommandsRequest(request, response, { controller, pollingAct
     }
   } catch (error) {
     log.error('[专题轮询控制] 指令处理失败', {
+      exhibitionId,
       error: error && error.message ? error.message : String(error)
     });
     sendJson(response, 500, { ok: false, error: 'polling command failed' });
   }
 }
 
-function createHealthServer({ controller, pollingActions, logger } = {}) {
-  const log = logger || { info() {}, error() {} };
+function createHealthServer({ controllers, tokenMap, pollingActions, logger } = {}) {
+  const log = logger || { info() {}, warn() {}, error() {} };
 
   return http.createServer((request, response) => {
     const path = String(request.url || '').split('?')[0];
@@ -165,13 +174,35 @@ function createHealthServer({ controller, pollingActions, logger } = {}) {
         return;
       }
 
+      const presentedToken = readTokenHeader(request);
+      const exhibitionId = resolveExhibitionId(presentedToken, tokenMap);
+      if (!exhibitionId) {
+        const reason = typeof presentedToken === 'string' && presentedToken.trim() !== '' ? 'invalid_token' : 'missing_token';
+        log.warn('[专题轮询控制] 请求被拒绝，未改变任何轮询状态', {
+          method: request.method,
+          path,
+          remoteAddress: request.socket?.remoteAddress,
+          headerName: TOKEN_HEADER,
+          reason
+        });
+        sendJson(response, 401, { ok: false, error: 'unauthorized' });
+        return;
+      }
+
       log.info('[专题轮询控制] 收到指令请求', {
         method: request.method,
         path,
+        exhibitionId,
         remoteAddress: request.socket?.remoteAddress
       });
-      handleCommandsRequest(request, response, { controller, pollingActions, log }).catch((error) => {
+      handleCommandsRequest(request, response, {
+        controller: controllers ? controllers.get(exhibitionId) : null,
+        exhibitionId,
+        pollingActions,
+        log
+      }).catch((error) => {
         log.error('[专题轮询控制] 指令处理异常', {
+          exhibitionId,
           error: error && error.message ? error.message : String(error)
         });
         if (!response.writableEnded) {

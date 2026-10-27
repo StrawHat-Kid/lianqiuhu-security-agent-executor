@@ -1,4 +1,4 @@
-const { loadConfig } = require('./config');
+const { loadConfig, findSharedRecipients } = require('./config');
 const { createLogger } = require('./logger');
 const { createRuisiClient } = require('./ruisi-client');
 const { PollingRunner } = require('./polling-runner');
@@ -23,37 +23,52 @@ async function start({
   scriptDefinition = script
 } = {}) {
   const config = loadConfigFn();
+  const halls = config.halls instanceof Map ? config.halls : new Map();
 
   logger.info('[专题轮询] 执行器启动中', {
     name: SUBJECT_NAME,
-    agent: config.agent,
-    to: TO,
     port: config.port,
-    ingressHost: config.ingressHost,
-    ingressPort: config.ingressPort
+    exhibitionCount: halls.size,
+    halls: [...halls.values()].map((hall) => ({
+      exhibitionId: hall.hallId,
+      agent: hall.agent,
+      to: hall.to || TO,
+      ingressHost: hall.ingressHost,
+      ingressPort: hall.ingressPort
+    }))
   });
 
-  const client = createRuisiClientFn({
-    ...config,
-    authToken: config.ingressToken,
-    timeoutMs: config.ingressTimeoutMs,
-    logger
-  });
-  const controller = createPollingControllerFn({
-    logger,
-    subjectName: SUBJECT_NAME,
-    maxDurationMs: config.pollingMaxDurationMs,
-    createRunner: () => createPollingRunnerFn({
-      agent: config.agent,
-      to: TO,
-      script: scriptDefinition,
-      client,
+  for (const shared of findSharedRecipients(halls, TO)) {
+    logger.warn('[专题轮询] 多个展厅共用同一回程接收方，请确认产品配置', shared);
+  }
+
+  const controllers = new Map();
+  for (const [exhibitionId, hall] of halls) {
+    const subjectName = `${SUBJECT_NAME}[${exhibitionId}]`;
+    const client = createRuisiClientFn({
+      ingressUrl: hall.ingressUrl,
+      authToken: hall.ingressToken,
+      timeoutMs: config.ingressTimeoutMs,
+      logger
+    });
+    controllers.set(exhibitionId, createPollingControllerFn({
       logger,
-      subjectName: SUBJECT_NAME
-    })
-  });
+      subjectName,
+      maxDurationMs: config.pollingMaxDurationMs,
+      createRunner: () => createPollingRunnerFn({
+        agent: hall.agent,
+        to: hall.to || TO,
+        script: scriptDefinition,
+        client,
+        logger,
+        subjectName
+      })
+    }));
+  }
+
   const server = createHealthServerFn({
-    controller,
+    controllers,
+    tokenMap: config.tokenMap,
     pollingActions: { start: POLLING_START_ACTION, cancel: POLLING_CANCEL_ACTION },
     logger
   });
@@ -73,8 +88,10 @@ async function start({
   logger.info('[专题轮询] 回程轮询默认未开启，等待指令调用', {
     name: SUBJECT_NAME,
     commandPath: '/api/commands',
+    tokenHeader: 'X-HC-Token',
     startAction: POLLING_START_ACTION,
     cancelAction: POLLING_CANCEL_ACTION,
+    exhibitionIds: [...halls.keys()],
     pollingMaxDurationHours: config.pollingMaxDurationHours
   });
 
@@ -86,7 +103,7 @@ async function start({
         logger.info('[专题轮询] 执行器停止中', { name: SUBJECT_NAME, reason });
 
         try {
-          await controller.shutdown(reason);
+          await Promise.all([...controllers.values()].map((controller) => controller.shutdown(reason)));
         } finally {
           await closeHttpServerFn(server);
           logger.info('[专题轮询] HTTP 服务已关闭', { port: config.port });
@@ -97,7 +114,7 @@ async function start({
     return shutdownPromise;
   };
 
-  return { config, server, controller, shutdown, logger };
+  return { config, server, controllers, shutdown, logger };
 }
 
 function installShutdownHandlers({ running, logger, processRef = process }) {

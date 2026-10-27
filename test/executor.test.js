@@ -2,7 +2,7 @@ const http = require('node:http');
 const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { readConfig } = require('../src/config');
+const { readHallConfig } = require('../src/config');
 const { createLogger, formatBeijingTimestamp } = require('../src/logger');
 const { createRuisiClient } = require('../src/ruisi-client');
 const { PollingRunner } = require('../src/polling-runner');
@@ -11,6 +11,24 @@ const script = require('../src/scripts/messages');
 const { TO, start, installShutdownHandlers } = require('../src');
 
 const TEST_AGENT = 'rs-demorg-secops';
+const TEST_AGENT_B = 'rs-demorg-secops-b';
+const TEST_TOKEN_A = 'test-token-a-0123456789abcdef';
+const TEST_TOKEN_B = 'test-token-b-0123456789abcdef';
+const HALL_A = 'exhibition-a';
+const HALL_B = 'exhibition-b';
+
+function legacySingleHallEnv(overrides = {}) {
+  return {
+    PORT: '18031',
+    HC_TOKEN_MAP: `${TEST_TOKEN_A}:${HALL_A}`,
+    AGENT: TEST_AGENT,
+    INGRESS_HOST: '127.0.0.1',
+    INGRESS_PORT: '29876',
+    INGRESS_TOKEN: 'test',
+    ...overrides
+  };
+}
+
 
 function loggerCapture() {
   const entries = [];
@@ -55,18 +73,32 @@ function createRunner(options = {}) {
   });
 }
 
-test('配置校验并按 host、port 生成固定回程 URL', () => {
-  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
-  assert.deepEqual(
-    readConfig(baseEnv),
-    { agent: TEST_AGENT, port: 18031, ingressHost: '127.0.0.1', ingressPort: 29876, ingressToken: 'test', ingressTimeoutMs: 5000, pollingMaxDurationHours: 10, pollingMaxDurationMs: 36000000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
+test('单展厅兼容配置按 host、port 生成回程 URL', () => {
+  const config = readHallConfig(legacySingleHallEnv());
+  const hall = config.halls.get(HALL_A);
+  assert.deepEqual(hall, {
+    hallId: HALL_A,
+    agent: TEST_AGENT,
+    ingressHost: '127.0.0.1',
+    ingressPort: 29876,
+    ingressToken: 'test',
+    to: null,
+    ingressUrl: 'http://127.0.0.1:29876/agent/send'
+  });
+  assert.equal(config.port, 18031);
+  assert.equal(config.ingressTimeoutMs, 5000);
+  assert.equal(config.pollingMaxDurationHours, 10);
+  assert.equal(config.pollingMaxDurationMs, 36000000);
+  assert.equal(
+    readHallConfig(legacySingleHallEnv({ HC_HALL_EXHIBITION_A_AGENT: 'overridden-agent' })).halls.get(HALL_A).agent,
+    'overridden-agent'
   );
-  assert.equal(readConfig({ ...baseEnv, AGENT: 'overridden-agent' }).agent, 'overridden-agent');
-  assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }), /AGENT/);
-  assert.equal(readConfig({ ...baseEnv, PORT: '24000' }).port, 24000);
-  assert.throws(() => readConfig({ ...baseEnv, PORT: 'invalid' }), /PORT/);
-  assert.throws(() => readConfig({ AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: 'bad', INGRESS_TOKEN: 'test' }), /INGRESS_PORT/);
-  assert.throws(() => readConfig({ AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '1' }), /INGRESS_TOKEN/);
+  assert.throws(() => readHallConfig(legacySingleHallEnv({ HC_TOKEN_MAP: '' })), /HC_TOKEN_MAP/);
+  assert.throws(() => readHallConfig(legacySingleHallEnv({ AGENT: '' })), /AGENT/);
+  assert.equal(readHallConfig(legacySingleHallEnv({ PORT: '24000' })).port, 24000);
+  assert.throws(() => readHallConfig(legacySingleHallEnv({ PORT: 'invalid' })), /PORT/);
+  assert.throws(() => readHallConfig(legacySingleHallEnv({ HC_HALL_EXHIBITION_A_INGRESS_PORT: 'bad' })), /INGRESS_PORT/);
+  assert.throws(() => readHallConfig(legacySingleHallEnv({ INGRESS_TOKEN: '' })), /INGRESS_TOKEN/);
 });
 
 test('段落01第1条启动后立即发送，不先 sleep(0)', async () => {
@@ -206,17 +238,37 @@ test('日志保持北京时间 HH:mm:ss 格式且 token 脱敏', () => {
   assert.doesNotMatch(lines[0], /must-not-appear/);
 });
 
+function createTestHalls() {
+  return new Map([
+    [HALL_A, {
+      hallId: HALL_A,
+      agent: TEST_AGENT,
+      ingressHost: '127.0.0.1',
+      ingressPort: 29876,
+      ingressToken: 'test-token',
+      to: TO,
+      ingressUrl: 'http://127.0.0.1:29876/agent/send'
+    }],
+    [HALL_B, {
+      hallId: HALL_B,
+      agent: TEST_AGENT_B,
+      ingressHost: '127.0.0.1',
+      ingressPort: 29877,
+      ingressToken: 'test-token-b',
+      to: TO,
+      ingressUrl: 'http://127.0.0.1:29877/agent/send'
+    }]
+  ]);
+}
+
 function createTestConfig(port, overrides = {}) {
   return {
-    agent: TEST_AGENT,
     port,
-    ingressHost: '127.0.0.1',
-    ingressPort: 29876,
-    ingressToken: 'test-token',
     ingressTimeoutMs: 1000,
     pollingMaxDurationHours: 10,
     pollingMaxDurationMs: 36000000,
-    ingressUrl: 'http://127.0.0.1:29876/agent/send',
+    tokenMap: new Map([[TEST_TOKEN_A, HALL_A], [TEST_TOKEN_B, HALL_B]]),
+    halls: createTestHalls(),
     ...overrides
   };
 }
@@ -259,10 +311,11 @@ async function requestHealth(port) {
   });
 }
 
-async function requestJson(port, method, path, payload) {
+async function requestJson(port, method, path, payload, token = TEST_TOKEN_A) {
   const body = payload === undefined ? null : JSON.stringify(payload);
   return new Promise((resolve, reject) => {
     const headers = body === null ? {} : { 'Content-Type': 'application/json' };
+    if (token !== null) headers['X-HC-Token'] = token;
     const request = http.request({ host: '127.0.0.1', port, method, path, headers }, (response) => {
       response.setEncoding('utf8');
       let responseBody = '';
@@ -275,9 +328,11 @@ async function requestJson(port, method, path, payload) {
   });
 }
 
-async function requestRaw(port, method, path, text) {
+async function requestRaw(port, method, path, text, token = TEST_TOKEN_A) {
   return new Promise((resolve, reject) => {
-    const request = http.request({ host: '127.0.0.1', port, method, path, headers: { 'Content-Type': 'application/json' } }, (response) => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (token !== null) headers['X-HC-Token'] = token;
+    const request = http.request({ host: '127.0.0.1', port, method, path, headers }, (response) => {
       response.setEncoding('utf8');
       let responseBody = '';
       response.on('data', (chunk) => { responseBody += chunk; });
@@ -324,7 +379,9 @@ test('启动后仅监听 HTTP 服务，不自动创建 Polling Runner，/health 
 
   try {
     assert.equal(running.server.address().port, port);
-    assert.equal(running.config.agent, TEST_AGENT);
+    assert.equal(running.controllers.size, 2);
+    assert.equal(running.controllers.get(HALL_A).getStatus().state, 'stopped');
+    assert.equal(running.controllers.get(HALL_B).getStatus().state, 'stopped');
     assert.equal(runners.length, 0);
     assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
   } finally {
@@ -666,7 +723,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
       createRuisiClientFn: () => ({}),
       createPollingRunnerFn: () => runner
     });
-    await running.controller.start();
+    await running.controllers.get(HALL_A).start();
     assert.equal(runner.started, 1);
     const processRef = new EventEmitter();
     const shutdownHandlers = installShutdownHandlers({ running, logger: loggerCapture(), processRef });
@@ -703,32 +760,32 @@ test('未开启轮询时收到 SIGTERM 仍释放监听端口', async () => {
 });
 
 test('配置项 POLLING_MAX_DURATION_HOURS 默认 10 小时，合法值生效，非法值启动时明确报错', () => {
-  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
-  assert.equal(readConfig(baseEnv).pollingMaxDurationHours, 10);
-  assert.equal(readConfig(baseEnv).pollingMaxDurationMs, 36000000);
-  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '' }).pollingMaxDurationHours, 10);
-  const custom = readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.5' });
+  const baseEnv = legacySingleHallEnv();
+  assert.equal(readHallConfig(baseEnv).pollingMaxDurationHours, 10);
+  assert.equal(readHallConfig(baseEnv).pollingMaxDurationMs, 36000000);
+  assert.equal(readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '' }).pollingMaxDurationHours, 10);
+  const custom = readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.5' });
   assert.equal(custom.pollingMaxDurationHours, 0.5);
   assert.equal(custom.pollingMaxDurationMs, 1800000);
-  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '2' }).pollingMaxDurationMs, 7200000);
+  assert.equal(readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '2' }).pollingMaxDurationMs, 7200000);
   for (const invalid of ['0', '-1', 'abc', 'Infinity', 'NaN', '1e999']) {
-    assert.throws(() => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: invalid }), /POLLING_MAX_DURATION_HOURS/);
+    assert.throws(() => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: invalid }), /POLLING_MAX_DURATION_HOURS/);
   }
 });
 
 test('配置项 POLLING_MAX_DURATION_HOURS 拒绝定时器溢出值和舍入为零的值', () => {
-  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
-  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.52' }).pollingMaxDurationMs, 2147472000);
+  const baseEnv = legacySingleHallEnv();
+  assert.equal(readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.52' }).pollingMaxDurationMs, 2147472000);
   assert.throws(
-    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.53' }),
+    () => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.53' }),
     /POLLING_MAX_DURATION_HOURS is out of supported range.*2147483647/
   );
   assert.throws(
-    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '1000' }),
+    () => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '1000' }),
     /POLLING_MAX_DURATION_HOURS is out of supported range.*2147483647/
   );
   assert.throws(
-    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.0000001' }),
+    () => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.0000001' }),
     /POLLING_MAX_DURATION_HOURS is out of supported range/
   );
 });
@@ -940,7 +997,7 @@ test('HTTP 启动指令开始计时，自动停止后服务仍可用且可再次
     t.mock.timers.tick(2000);
     await drainTasks();
     assert.equal(runners[0].stopped, 1);
-    assert.equal(running.controller.getStatus().state, 'stopped');
+    assert.equal(running.controllers.get(HALL_A).getStatus().state, 'stopped');
 
     assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
 
@@ -949,7 +1006,7 @@ test('HTTP 启动指令开始计时，自动停止后服务仍可用且可再次
       body: { ok: true, message: 'polling started' }
     });
     assert.equal(runners.length, 2);
-    assert.equal(running.controller.getStatus().state, 'running');
+    assert.equal(running.controllers.get(HALL_A).getStatus().state, 'running');
 
     t.mock.timers.tick(2000);
     await drainTasks();
